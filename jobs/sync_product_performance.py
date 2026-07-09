@@ -82,6 +82,7 @@ def get_window_bounds(source_table: str, date_column: str, days: int, window_mod
     if window_mode == "current_date":
         end_date = date.today()
     else:
+        logger.info(f"开始获取源表最大日期: SELECT MAX({date_column}) FROM {source_table}")
         with db_cursor() as cursor:
             cursor.execute(f"SELECT MAX({date_sql}) AS max_dt FROM {table_sql} WHERE {date_sql} IS NOT NULL")
             row = cursor.fetchone()
@@ -94,6 +95,7 @@ def get_window_bounds(source_table: str, date_column: str, days: int, window_mod
             end_date = max_dt
         else:
             end_date = datetime.strptime(str(max_dt)[:10], "%Y-%m-%d").date()
+        logger.info(f"源表最大日期: {end_date}")
 
     start_date = end_date - timedelta(days=days - 1)
     end_exclusive = end_date + timedelta(days=1)
@@ -123,7 +125,7 @@ def build_order_sql(date_column: str, source_column_names: set) -> str:
 
 
 def count_product_performance_window(source_table: str, date_column: str, days: int, window_mode: str) -> Tuple[int, date, date]:
-    """Count rows for a window. Used by dry-run to avoid SELECT * on a large table."""
+    """Count rows for a window. This may be slow if date_column has no index."""
     start_date, end_date, end_exclusive = get_window_bounds(source_table, date_column, days, window_mode)
     table_sql = quote_identifier(source_table)
     date_sql = quote_identifier(date_column)
@@ -133,12 +135,20 @@ def count_product_performance_window(source_table: str, date_column: str, days: 
         WHERE {date_sql} >= %s
           AND {date_sql} < %s
     """
+    logger.info(f"开始统计 {days} 天窗口行数: {start_date} ~ {end_date}")
     with db_cursor() as cursor:
         cursor.execute(sql, (start_date, end_exclusive))
         row = cursor.fetchone()
     count = int((row or {}).get("cnt") or 0)
     logger.info(f"统计 {days} 天窗口数据: {start_date} ~ {end_date}，共 {count} 行")
     return count, start_date, end_date
+
+
+def get_product_performance_window_only(source_table: str, date_column: str, days: int, window_mode: str) -> Tuple[date, date]:
+    """Fast dry-run path: only compute window dates, without COUNT(*) or SELECT *."""
+    start_date, end_date, _ = get_window_bounds(source_table, date_column, days, window_mode)
+    logger.info(f"{days} 天窗口: {start_date} ~ {end_date}（未统计行数）")
+    return start_date, end_date
 
 
 def read_product_performance_window(
@@ -219,12 +229,22 @@ async def async_main(args: argparse.Namespace) -> None:
     field_specs = build_field_specs(columns)
 
     if args.dry_run:
-        count_90d, start_90d, end_90d = count_product_performance_window(source_table, date_column, 90, window_mode)
-        count_7d, start_7d, end_7d = count_product_performance_window(source_table, date_column, 7, window_mode)
+        if args.count_rows:
+            count_90d, start_90d, end_90d = count_product_performance_window(source_table, date_column, 90, window_mode)
+            count_7d, start_7d, end_7d = count_product_performance_window(source_table, date_column, 7, window_mode)
+            count_msg_90d = f"{count_90d} 行"
+            count_msg_7d = f"{count_7d} 行"
+        else:
+            start_90d, end_90d = get_product_performance_window_only(source_table, date_column, 90, window_mode)
+            start_7d, end_7d = get_product_performance_window_only(source_table, date_column, 7, window_mode)
+            count_msg_90d = "未统计行数"
+            count_msg_7d = "未统计行数"
+
         logger.info("=" * 80)
         logger.info("dry-run 数据库检查完成：不会清空或写入飞书")
-        logger.info(f"90天窗口: {start_90d} ~ {end_90d} / {count_90d} 行")
-        logger.info(f"7天窗口: {start_7d} ~ {end_7d} / {count_7d} 行")
+        logger.info(f"90天窗口: {start_90d} ~ {end_90d} / {count_msg_90d}")
+        logger.info(f"7天窗口: {start_7d} ~ {end_7d} / {count_msg_7d}")
+        logger.info("如需统计行数，请追加参数: --count-rows。若很慢，说明日期字段可能没有索引。")
         logger.info("如需同时检查飞书 token/table，请追加参数: --check-feishu")
         logger.info("=" * 80)
         if not args.check_feishu:
@@ -280,7 +300,8 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="窗口结束日期：latest_date=源表MAX日期；current_date=服务器当天",
     )
-    parser.add_argument("--dry-run", action="store_true", help="只检查数据库窗口行数；默认不访问飞书、不清空、不写入")
+    parser.add_argument("--dry-run", action="store_true", help="只检查数据库窗口日期；默认不访问飞书、不统计行数、不清空、不写入")
+    parser.add_argument("--count-rows", action="store_true", help="配合 --dry-run 使用：额外统计90天/7天行数，源表无日期索引时可能很慢")
     parser.add_argument("--check-feishu", action="store_true", help="配合 --dry-run 使用：额外检查飞书 token 和目标 table 解析")
     return parser.parse_args()
 
