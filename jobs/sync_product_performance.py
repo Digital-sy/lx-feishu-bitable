@@ -32,6 +32,7 @@ MYSQL_NUMBER_TYPES = {
 }
 MYSQL_DATE_TYPES = {"date", "datetime", "timestamp"}
 MYSQL_TEXT_TYPES = {"char", "varchar", "text", "tinytext", "mediumtext", "longtext", "json", "enum", "set"}
+DEFAULT_HARD_SYNC_ROW_LIMIT = 200000
 
 
 def get_source_columns(source_table: str) -> List[Dict[str, Any]]:
@@ -151,6 +152,36 @@ def get_product_performance_window_only(source_table: str, date_column: str, day
     return start_date, end_date
 
 
+def assert_sync_size_safe(source_table: str, date_column: str, window_mode: str, force_large_sync: bool) -> None:
+    """Preflight count before full SELECT * and Feishu refresh."""
+    count_90d, start_90d, end_90d = count_product_performance_window(source_table, date_column, 90, window_mode)
+    count_7d, start_7d, end_7d = count_product_performance_window(source_table, date_column, 7, window_mode)
+    max_records = settings.MAX_FEISHU_RECORDS if settings.MAX_FEISHU_RECORDS > 0 else DEFAULT_HARD_SYNC_ROW_LIMIT
+
+    logger.info("=" * 80)
+    logger.info("正式同步前行数预检")
+    logger.info(f"90天窗口: {start_90d} ~ {end_90d} / {count_90d} 行")
+    logger.info(f"7天窗口: {start_7d} ~ {end_7d} / {count_7d} 行")
+    logger.info(f"当前安全上限: {max_records} 行/表")
+    logger.info("=" * 80)
+
+    if force_large_sync:
+        logger.warning("已启用 --force-large-sync，将跳过行数安全保护。不建议用于飞书明细表。")
+        return
+
+    oversized = []
+    if count_90d > max_records:
+        oversized.append(f"90天表 {count_90d} 行 > {max_records}")
+    if count_7d > max_records:
+        oversized.append(f"7天表 {count_7d} 行 > {max_records}")
+    if oversized:
+        raise RuntimeError(
+            "正式同步已中止，原因：" + "；".join(oversized) + "。"
+            "这个量级不适合直接写飞书明细表。请改为聚合表/异常清单/Top N，"
+            "或确认风险后使用 --force-large-sync 强制执行。"
+        )
+
+
 def read_product_performance_window(
     source_table: str,
     date_column: str,
@@ -202,11 +233,11 @@ async def refresh_one_window(
     logger.info(f"准备刷新飞书表: {table_name or table_id} / {days}天 / {start_date} ~ {end_date}")
     logger.info("=" * 80)
 
-    max_records = settings.MAX_FEISHU_RECORDS
-    if max_records > 0 and len(rows) > max_records:
+    max_records = settings.MAX_FEISHU_RECORDS if settings.MAX_FEISHU_RECORDS > 0 else DEFAULT_HARD_SYNC_ROW_LIMIT
+    if len(rows) > max_records:
         raise RuntimeError(
-            f"{days}天数据共 {len(rows)} 行，超过 MAX_FEISHU_RECORDS={max_records}。"
-            "请提高飞书容量、缩小窗口，或把 MAX_FEISHU_RECORDS 改为 0 后由飞书 API 自身判断。"
+            f"{days}天数据共 {len(rows)} 行，超过安全上限 {max_records}。"
+            "请改为聚合表/异常清单/Top N，或使用 --force-large-sync 强制执行。"
         )
 
     await client.ensure_fields(table_id, field_specs)
@@ -261,6 +292,8 @@ async def async_main(args: argparse.Namespace) -> None:
         logger.info("=" * 80)
         return
 
+    assert_sync_size_safe(source_table, date_column, window_mode, args.force_large_sync)
+
     rows_90d, start_90d, end_90d = read_product_performance_window(
         source_table, date_column, 90, window_mode, source_column_names
     )
@@ -303,6 +336,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="只检查数据库窗口日期；默认不访问飞书、不统计行数、不清空、不写入")
     parser.add_argument("--count-rows", action="store_true", help="配合 --dry-run 使用：额外统计90天/7天行数，源表无日期索引时可能很慢")
     parser.add_argument("--check-feishu", action="store_true", help="配合 --dry-run 使用：额外检查飞书 token 和目标 table 解析")
+    parser.add_argument("--force-large-sync", action="store_true", help="强制同步超大明细数据。不建议用于飞书，可能内存暴涨或写入失败")
     return parser.parse_args()
 
 
