@@ -170,6 +170,14 @@ def read_product_performance_window(
     return rows, start_date, end_date
 
 
+async def resolve_target_tables(client: FeishuBitableClient) -> Tuple[str, str]:
+    logger.info("开始解析飞书目标表...")
+    table_90d_id = await client.resolve_table_id(settings.FEISHU_90D_TABLE_ID, settings.FEISHU_90D_TABLE_NAME)
+    table_7d_id = await client.resolve_table_id(settings.FEISHU_7D_TABLE_ID, settings.FEISHU_7D_TABLE_NAME)
+    logger.info("飞书目标表解析完成")
+    return table_90d_id, table_7d_id
+
+
 async def refresh_one_window(
     client: FeishuBitableClient,
     table_id: str,
@@ -210,17 +218,26 @@ async def async_main(args: argparse.Namespace) -> None:
     source_column_names = {col["COLUMN_NAME"] for col in columns}
     field_specs = build_field_specs(columns)
 
-    client = FeishuBitableClient(settings.FEISHU_APP_TOKEN)
-    table_90d_id = await client.resolve_table_id(settings.FEISHU_90D_TABLE_ID, settings.FEISHU_90D_TABLE_NAME)
-    table_7d_id = await client.resolve_table_id(settings.FEISHU_7D_TABLE_ID, settings.FEISHU_7D_TABLE_NAME)
-
     if args.dry_run:
         count_90d, start_90d, end_90d = count_product_performance_window(source_table, date_column, 90, window_mode)
         count_7d, start_7d, end_7d = count_product_performance_window(source_table, date_column, 7, window_mode)
         logger.info("=" * 80)
-        logger.info("dry-run 完成：不会清空或写入飞书")
-        logger.info(f"90天表: {settings.FEISHU_90D_TABLE_NAME or table_90d_id} / {start_90d} ~ {end_90d} / {count_90d} 行")
-        logger.info(f"7天表: {settings.FEISHU_7D_TABLE_NAME or table_7d_id} / {start_7d} ~ {end_7d} / {count_7d} 行")
+        logger.info("dry-run 数据库检查完成：不会清空或写入飞书")
+        logger.info(f"90天窗口: {start_90d} ~ {end_90d} / {count_90d} 行")
+        logger.info(f"7天窗口: {start_7d} ~ {end_7d} / {count_7d} 行")
+        logger.info("如需同时检查飞书 token/table，请追加参数: --check-feishu")
+        logger.info("=" * 80)
+        if not args.check_feishu:
+            return
+
+    client = FeishuBitableClient(settings.FEISHU_APP_TOKEN)
+    table_90d_id, table_7d_id = await resolve_target_tables(client)
+
+    if args.dry_run:
+        logger.info("=" * 80)
+        logger.info("dry-run 飞书检查完成：不会清空或写入飞书")
+        logger.info(f"90天表: {settings.FEISHU_90D_TABLE_NAME or table_90d_id} => {table_90d_id}")
+        logger.info(f"7天表: {settings.FEISHU_7D_TABLE_NAME or table_7d_id} => {table_7d_id}")
         logger.info("=" * 80)
         return
 
@@ -263,7 +280,8 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="窗口结束日期：latest_date=源表MAX日期；current_date=服务器当天",
     )
-    parser.add_argument("--dry-run", action="store_true", help="只读库和解析飞书表，不清空、不写入飞书")
+    parser.add_argument("--dry-run", action="store_true", help="只检查数据库窗口行数；默认不访问飞书、不清空、不写入")
+    parser.add_argument("--check-feishu", action="store_true", help="配合 --dry-run 使用：额外检查飞书 token 和目标 table 解析")
     return parser.parse_args()
 
 
