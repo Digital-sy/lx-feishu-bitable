@@ -134,7 +134,9 @@ class FeishuBitableClient:
         headers = await self._headers()
         payload: Dict[str, Any] = {"field_name": field_name, "type": field_type}
         if field_type == 2:
-            payload["property"] = {"precision": precision, "formatter": "0"}
+            precision = max(int(precision or 0), 0)
+            formatter = "0" if precision == 0 else "0." + ("0" * min(precision, 10))
+            payload["property"] = {"precision": min(precision, 10), "formatter": formatter}
 
         timeout = httpx.Timeout(60.0, connect=10.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
