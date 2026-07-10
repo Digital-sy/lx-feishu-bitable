@@ -29,6 +29,7 @@ logger = get_logger("sync_product_performance")
 DEFAULT_HARD_SYNC_ROW_LIMIT = 200000
 
 AGG_FIELD_SPECS: List[Dict[str, Any]] = [
+    {"name": "父ASIN", "type": 1, "precision": 0},
     {"name": "统计窗口", "type": 1, "precision": 0},
     {"name": "开始日期", "type": 5, "precision": 0},
     {"name": "结束日期", "type": 5, "precision": 0},
@@ -55,6 +56,7 @@ AGG_FIELD_SPECS: List[Dict[str, Any]] = [
 ]
 
 REQUIRED_SOURCE_COLUMNS = {
+    "parent_asin",
     "seller_name",
     "country",
     "spu",
@@ -194,6 +196,7 @@ def read_product_performance_aggregate(
 
     sql = f"""
         SELECT
+            COALESCE(MAX(NULLIF(parent_asin, '')), '') AS `父ASIN`,
             %s AS `统计窗口`,
             %s AS `开始日期`,
             %s AS `结束日期`,
