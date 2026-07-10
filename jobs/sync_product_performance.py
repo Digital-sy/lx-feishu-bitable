@@ -27,6 +27,7 @@ from common.database import db_cursor
 logger = get_logger("sync_product_performance")
 
 DEFAULT_HARD_SYNC_ROW_LIMIT = 200000
+DATE_OUTPUT_FIELDS = {"开始日期", "结束日期"}
 
 AGG_FIELD_SPECS: List[Dict[str, Any]] = [
     {"name": "父asin", "type": 1, "precision": 0},
@@ -44,6 +45,8 @@ AGG_FIELD_SPECS: List[Dict[str, Any]] = [
     {"name": "广告花费", "type": 2, "precision": 2},
     {"name": "广告销售额", "type": 2, "precision": 2},
     {"name": "点击量", "type": 2, "precision": 0},
+    {"name": "CPC", "type": 2, "precision": 6},
+    {"name": "广告转化率", "type": 2, "precision": 6},
     {"name": "展示量", "type": 2, "precision": 0},
     {"name": "Sessions", "type": 2, "precision": 0},
     {"name": "转化率", "type": 2, "precision": 6},
@@ -67,6 +70,7 @@ REQUIRED_SOURCE_COLUMNS = {
     "gross_profit",
     "spend",
     "ad_sales_amount",
+    "ad_order_quantity",
     "clicks",
     "impressions",
     "sessions_total",
@@ -135,6 +139,14 @@ def get_window_bounds(source_table: str, date_column: str, days: int, window_mod
 def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
     clean: Dict[str, Any] = {}
     for key, value in row.items():
+        if key in DATE_OUTPUT_FIELDS and isinstance(value, str):
+            value_text = value.strip()
+            if value_text:
+                try:
+                    clean[key] = datetime.strptime(value_text[:10], "%Y-%m-%d").date()
+                    continue
+                except ValueError:
+                    logger.warning(f"日期字段 {key} 无法解析为日期，将按原值写入: {value}")
         if isinstance(value, Decimal):
             clean[key] = float(value)
         elif isinstance(value, bytes):
@@ -211,6 +223,8 @@ def read_product_performance_aggregate(
             ROUND(SUM(COALESCE(spend, 0)), 2) AS `广告花费`,
             ROUND(SUM(COALESCE(ad_sales_amount, 0)), 2) AS `广告销售额`,
             SUM(COALESCE(clicks, 0)) AS `点击量`,
+            ROUND(SUM(COALESCE(spend, 0)) / NULLIF(SUM(COALESCE(clicks, 0)), 0), 6) AS `CPC`,
+            ROUND(SUM(COALESCE(ad_order_quantity, 0)) / NULLIF(SUM(COALESCE(clicks, 0)), 0), 6) AS `广告转化率`,
             SUM(COALESCE(impressions, 0)) AS `展示量`,
             SUM(COALESCE(sessions_total, 0)) AS `Sessions`,
             ROUND(SUM(COALESCE(volume, 0)) / NULLIF(SUM(COALESCE(sessions_total, 0)), 0), 6) AS `转化率`,
