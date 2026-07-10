@@ -132,27 +132,42 @@ class FeishuBitableClient:
     async def create_field(self, table_id: str, field_name: str, field_type: int, precision: int = 0) -> str:
         url = f"{self.api_base}/bitable/v1/apps/{self.app_token}/tables/{table_id}/fields"
         headers = await self._headers()
-        payload: Dict[str, Any] = {"field_name": field_name, "type": field_type}
-        if field_type == 2:
-            precision = max(int(precision or 0), 0)
-            formatter = "0" if precision == 0 else "0." + ("0" * min(precision, 10))
-            payload["property"] = {"precision": min(precision, 10), "formatter": formatter}
-
         timeout = httpx.Timeout(60.0, connect=10.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(url, headers=headers, json=payload)
-            result = response.json()
 
-        if result.get("code") == 0:
-            field_id = (result.get("data") or {}).get("field", {}).get("field_id", "")
-            logger.info(f"创建字段成功: {field_name} ({field_id})")
-            return field_id
+        payloads: List[Dict[str, Any]] = []
+        base_payload: Dict[str, Any] = {"field_name": field_name, "type": field_type}
 
-        msg = str(result.get("msg", ""))
-        if "already" in msg.lower() or "exist" in msg.lower() or "重复" in msg or "已存在" in msg:
-            logger.warning(f"字段已存在，跳过创建: {field_name}")
-            return ""
-        raise RuntimeError(f"创建字段失败 {field_name}: {result}")
+        if field_type == 2:
+            # 飞书数字字段的 formatter 校验较严格，不能传 0.000000 这类自定义格式。
+            # 先只传 precision；如果仍失败，再回退为不带 property 的默认数字字段。
+            safe_precision = min(max(int(precision or 0), 0), 10)
+            payloads.append({**base_payload, "property": {"precision": safe_precision}})
+            payloads.append(base_payload)
+        else:
+            payloads.append(base_payload)
+
+        last_result: Optional[Dict[str, Any]] = None
+        for idx, payload in enumerate(payloads, start=1):
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(url, headers=headers, json=payload)
+                result = response.json()
+            last_result = result
+
+            if result.get("code") == 0:
+                field_id = (result.get("data") or {}).get("field", {}).get("field_id", "")
+                logger.info(f"创建字段成功: {field_name} ({field_id})")
+                return field_id
+
+            msg = str(result.get("msg", ""))
+            if "already" in msg.lower() or "exist" in msg.lower() or "重复" in msg or "已存在" in msg:
+                logger.warning(f"字段已存在，跳过创建: {field_name}")
+                return ""
+
+            if idx < len(payloads):
+                logger.warning(f"创建字段失败，尝试降级创建: {field_name}: {result}")
+                continue
+
+        raise RuntimeError(f"创建字段失败 {field_name}: {last_result}")
 
     async def ensure_fields(self, table_id: str, field_specs: List[Dict[str, Any]]) -> None:
         existing = await self.list_fields(table_id)
