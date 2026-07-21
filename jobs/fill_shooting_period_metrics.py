@@ -8,7 +8,7 @@ import sys
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 
@@ -30,9 +30,15 @@ STORE_MAP = {
 
 INPUT_FIELDS = {"款号", "店铺", "更换日期", "更换截至日期"}
 OUTPUT_FIELDS = {"CTR", "CPC", "点击量", "转化率", "广告转化率"}
-SOURCE_COLUMNS = {
-    "dt", "store_name", "country", "spu", "clicks", "impressions",
-    "order_qty", "ad_order_qty", "ad_cost_amt", "sessions_total",
+CORE_SOURCE_COLUMNS = {
+    "dt",
+    "store_name",
+    "country",
+    "clicks",
+    "impressions",
+    "order_qty",
+    "ad_order_qty",
+    "ad_cost_amt",
 }
 
 
@@ -76,21 +82,34 @@ def parse_date(value: Any) -> Optional[date]:
     raise ValueError(f"无法解析日期: {value!r}")
 
 
-async def request(client: FeishuBitableClient, method: str, path: str,
-                  params: Optional[Dict[str, Any]] = None,
-                  payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+async def request(
+    client: FeishuBitableClient,
+    method: str,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     headers = await client._headers()
     url = f"{client.api_base}/{path.lstrip('/')}"
     async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=20)) as http:
         response = await http.request(method, url, headers=headers, params=params, json=payload)
-    result = response.json()
+    try:
+        result = response.json()
+    except Exception as exc:
+        raise RuntimeError(
+            f"飞书接口返回非 JSON，HTTP {response.status_code}: {response.text[:500]}"
+        ) from exc
     if result.get("code") != 0:
         raise RuntimeError(f"飞书接口失败: {result}")
     return result
 
 
-async def list_records(client: FeishuBitableClient, app_token: str,
-                       table_id: str, view_id: str) -> List[Dict[str, Any]]:
+async def list_records(
+    client: FeishuBitableClient,
+    app_token: str,
+    table_id: str,
+    view_id: str,
+) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     page_token = ""
     while True:
@@ -100,7 +119,8 @@ async def list_records(client: FeishuBitableClient, app_token: str,
         if page_token:
             params["page_token"] = page_token
         result = await request(
-            client, "GET",
+            client,
+            "GET",
             f"bitable/v1/apps/{app_token}/tables/{table_id}/records",
             params=params,
         )
@@ -114,12 +134,17 @@ async def list_records(client: FeishuBitableClient, app_token: str,
     return rows
 
 
-async def update_records(client: FeishuBitableClient, app_token: str,
-                         table_id: str, updates: List[Dict[str, Any]]) -> None:
+async def update_records(
+    client: FeishuBitableClient,
+    app_token: str,
+    table_id: str,
+    updates: List[Dict[str, Any]],
+) -> None:
     for start in range(0, len(updates), 500):
         batch = updates[start:start + 500]
         await request(
-            client, "POST",
+            client,
+            "POST",
             f"bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_update",
             payload={"records": batch},
         )
@@ -148,45 +173,91 @@ def find_table(table_name: str, schema_name: str) -> Tuple[str, str]:
     return str(row["TABLE_SCHEMA"]), str(row["TABLE_NAME"])
 
 
-def validate_table(schema: str, table: str) -> None:
+def get_table_columns(schema: str, table: str) -> Set[str]:
     with db_cursor() as cursor:
         cursor.execute(
             "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
             "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s",
             (schema, table),
         )
-        columns = {str(row["COLUMN_NAME"]) for row in cursor.fetchall()}
-    missing = sorted(SOURCE_COLUMNS - columns)
+        return {str(row["COLUMN_NAME"]) for row in cursor.fetchall()}
+
+
+def resolve_source_layout(schema: str, table: str) -> Tuple[str, str, Set[str]]:
+    columns = get_table_columns(schema, table)
+    missing = sorted(CORE_SOURCE_COLUMNS - columns)
     if missing:
-        raise RuntimeError(f"源表缺少字段: {', '.join(missing)}")
+        raise RuntimeError(
+            f"源表 {schema}.{table} 缺少基础字段: {', '.join(missing)}；"
+            f"当前字段: {', '.join(sorted(columns))}"
+        )
+
+    if "spu" in columns:
+        product_expr = quote_identifier("spu")
+        product_note = "spu"
+    elif "sku" in columns:
+        product_expr = f"SUBSTRING_INDEX({quote_identifier('sku')}, '-', 1)"
+        product_note = "SUBSTRING_INDEX(sku, '-', 1)"
+    else:
+        raise RuntimeError(
+            f"源表 {schema}.{table} 既没有 spu，也没有可用于提取款号的 sku"
+        )
+
+    if "sessions_total" in columns:
+        sessions_expr = quote_identifier("sessions_total")
+        sessions_note = "sessions_total"
+    elif "sessions" in columns:
+        sessions_expr = quote_identifier("sessions")
+        sessions_note = "sessions"
+    else:
+        raise RuntimeError(
+            f"源表 {schema}.{table} 既没有 sessions_total，也没有 sessions；"
+            "无法按 订单量 / Sessions 计算转化率"
+        )
+
+    logger.info(f"款号口径使用: {product_note}")
+    logger.info(f"Sessions口径使用: {sessions_note}")
+    return product_expr, sessions_expr, columns
 
 
-def query_metrics(schema: str, table: str, spu: str, stores: List[str],
-                  start_date: date, end_date: date, country: str) -> Dict[str, Any]:
+def query_metrics(
+    schema: str,
+    table: str,
+    product_expr: str,
+    sessions_expr: str,
+    spu: str,
+    stores: List[str],
+    start_date: date,
+    end_date: date,
+    country: str,
+) -> Dict[str, Any]:
     placeholders = ",".join(["%s"] * len(stores))
     sql = f"""
-        SELECT COUNT(*) source_rows,
-               SUM(COALESCE(clicks,0)) clicks,
-               SUM(COALESCE(impressions,0)) impressions,
-               SUM(COALESCE(order_qty,0)) order_qty,
-               SUM(COALESCE(ad_order_qty,0)) ad_order_qty,
-               SUM(COALESCE(ad_cost_amt,0)) ad_cost_amt,
-               SUM(COALESCE(sessions_total,0)) sessions_total
+        SELECT
+            COUNT(*) AS source_rows,
+            SUM(COALESCE({quote_identifier('clicks')}, 0)) AS clicks,
+            SUM(COALESCE({quote_identifier('impressions')}, 0)) AS impressions,
+            SUM(COALESCE({quote_identifier('order_qty')}, 0)) AS order_qty,
+            SUM(COALESCE({quote_identifier('ad_order_qty')}, 0)) AS ad_order_qty,
+            SUM(COALESCE({quote_identifier('ad_cost_amt')}, 0)) AS ad_cost_amt,
+            SUM(COALESCE({sessions_expr}, 0)) AS sessions_total
         FROM {quote_identifier(schema)}.{quote_identifier(table)}
-        WHERE dt BETWEEN %s AND %s
-          AND spu=%s
-          AND store_name IN ({placeholders})
-          AND country=%s
+        WHERE {quote_identifier('dt')} BETWEEN %s AND %s
+          AND {product_expr} = %s
+          AND {quote_identifier('store_name')} IN ({placeholders})
+          AND {quote_identifier('country')} = %s
     """
     with db_cursor() as cursor:
         cursor.execute(sql, [start_date, end_date, spu, *stores, country])
         row = cursor.fetchone() or {}
+
     clicks = float(row.get("clicks") or 0)
     impressions = float(row.get("impressions") or 0)
     order_qty = float(row.get("order_qty") or 0)
     ad_order_qty = float(row.get("ad_order_qty") or 0)
     ad_cost_amt = float(row.get("ad_cost_amt") or 0)
     sessions_total = float(row.get("sessions_total") or 0)
+
     return {
         "source_rows": int(row.get("source_rows") or 0),
         "点击量": int(round(clicks)),
@@ -199,18 +270,23 @@ def query_metrics(schema: str, table: str, spu: str, stores: List[str],
 
 async def run(args: argparse.Namespace) -> None:
     schema, table = find_table(args.source_table, args.source_schema)
-    validate_table(schema, table)
     logger.info(f"数据源: {schema}.{table}")
+    product_expr, sessions_expr, _ = resolve_source_layout(schema, table)
 
     client = FeishuBitableClient(args.app_token)
     fields = await client.list_fields(args.table_id)
     if "广告转化率" not in fields:
         await client.create_field(args.table_id, "广告转化率", 2, precision=6)
         fields = await client.list_fields(args.table_id)
+
     missing = sorted((INPUT_FIELDS | OUTPUT_FIELDS) - set(fields))
     if missing:
         raise RuntimeError(f"飞书表缺少字段: {', '.join(missing)}")
-    wrong_types = [name for name in OUTPUT_FIELDS if int(fields[name].get("type") or 0) != 2]
+
+    wrong_types = [
+        name for name in OUTPUT_FIELDS
+        if int(fields[name].get("type") or 0) != 2
+    ]
     if wrong_types:
         raise RuntimeError(f"回写字段不是数字类型: {', '.join(sorted(wrong_types))}")
 
@@ -223,6 +299,7 @@ async def run(args: argparse.Namespace) -> None:
         values = record.get("fields") or {}
         spu = text(values.get("款号"))
         brands = options(values.get("店铺"))
+
         try:
             start_date = parse_date(values.get("更换日期"))
             end_date = parse_date(values.get("更换截至日期"))
@@ -230,25 +307,40 @@ async def run(args: argparse.Namespace) -> None:
             logger.warning(f"跳过 {spu or record_id}: {exc}")
             skipped += 1
             continue
+
         unknown = [brand for brand in brands if brand not in STORE_MAP]
         if not record_id or not spu or not brands or not start_date or not end_date or unknown:
             logger.warning(f"跳过 {spu or record_id}: 条件不完整或店铺未映射 {unknown}")
             skipped += 1
             continue
+
         if end_date < start_date:
             logger.warning(f"跳过 {spu}: 结束日期早于开始日期")
             skipped += 1
             continue
+
         stores = sorted({STORE_MAP[brand] for brand in brands})
-        metrics = query_metrics(schema, table, spu, stores, start_date, end_date, args.country)
+        metrics = query_metrics(
+            schema,
+            table,
+            product_expr,
+            sessions_expr,
+            spu,
+            stores,
+            start_date,
+            end_date,
+            args.country,
+        )
         output = {name: metrics[name] for name in OUTPUT_FIELDS}
         updates.append({"record_id": record_id, "fields": output})
+
         logger.info(
             f"{spu} | {brands}->{stores} | {start_date}~{end_date} | "
             f"rows={metrics['source_rows']} | 点击量={metrics['点击量']} | "
             f"CTR={metrics['CTR']} | CPC={metrics['CPC']} | "
             f"转化率={metrics['转化率']} | 广告转化率={metrics['广告转化率']}"
         )
+
         if args.limit and len(updates) >= args.limit:
             break
 
@@ -256,6 +348,7 @@ async def run(args: argparse.Namespace) -> None:
     if args.dry_run:
         logger.info("DRY RUN：未修改飞书")
         return
+
     await update_records(client, args.app_token, args.table_id, updates)
     logger.info("回写完成")
 
