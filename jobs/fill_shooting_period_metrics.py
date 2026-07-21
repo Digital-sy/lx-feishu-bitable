@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""按飞书记录中的款号、店铺和主图使用区间回填效果指标。"""
+"""按飞书记录中的款号、店铺和主图使用区间回填效果指标。
+
+当前回填：
+- 点击量
+- CTR = 点击量 / 展示量
+- CPC = 广告花费 / 点击量
+- 广告转化率 = 广告订单量 / 点击量
+- 近七天数据（最新主图） = 主区间末端最近 7 天 CTR
+
+“近七天数据（最新主图）”与 CTR 一样，按小数写入飞书数字/百分比字段。
+例如 3.25% 写入 0.0325。
+
+当前 DWS 尚无 Sessions 字段，因此不计算、不校验、不更新“转化率”。
+"""
 from __future__ import annotations
 
 import argparse
@@ -31,23 +44,43 @@ STORE_MAP = {
 }
 
 COUNTRY_VALUE_MAP = {
-    "US": "美国", "美国": "美国",
-    "CA": "加拿大", "加拿大": "加拿大",
-    "MX": "墨西哥", "墨西哥": "墨西哥",
-    "AU": "澳大利亚", "澳大利亚": "澳大利亚",
-    "UK": "英国", "GB": "英国", "英国": "英国",
-    "DE": "德国", "德国": "德国",
-    "FR": "法国", "法国": "法国",
-    "ES": "西班牙", "西班牙": "西班牙",
-    "IT": "意大利", "意大利": "意大利",
+    "US": "美国",
+    "美国": "美国",
+    "CA": "加拿大",
+    "加拿大": "加拿大",
+    "MX": "墨西哥",
+    "墨西哥": "墨西哥",
+    "AU": "澳大利亚",
+    "澳大利亚": "澳大利亚",
+    "UK": "英国",
+    "GB": "英国",
+    "英国": "英国",
+    "DE": "德国",
+    "德国": "德国",
+    "FR": "法国",
+    "法国": "法国",
+    "ES": "西班牙",
+    "西班牙": "西班牙",
+    "IT": "意大利",
+    "意大利": "意大利",
 }
 
 INPUT_FIELDS = {"款号", "店铺", "更换日期", "更换截至日期"}
-NUMERIC_OUTPUT_FIELDS = {"CTR", "CPC", "点击量", "广告转化率"}
-TEXT_OUTPUT_FIELDS = {"近七天数据（最新主图）"}
-ALL_OUTPUT_FIELDS = NUMERIC_OUTPUT_FIELDS | TEXT_OUTPUT_FIELDS
+NUMERIC_OUTPUT_FIELDS = {
+    "CTR",
+    "CPC",
+    "点击量",
+    "广告转化率",
+    "近七天数据（最新主图）",
+}
 CORE_SOURCE_COLUMNS = {
-    "dt", "store_name", "country", "clicks", "impressions", "ad_order_qty", "ad_cost_amt",
+    "dt",
+    "store_name",
+    "country",
+    "clicks",
+    "impressions",
+    "ad_order_qty",
+    "ad_cost_amt",
 }
 
 
@@ -82,6 +115,7 @@ def parse_date(value: Any) -> Optional[date]:
         if stamp > 10_000_000_000:
             stamp /= 1000
         return datetime.fromtimestamp(stamp).date()
+
     value_text = text(value)
     for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%d %H:%M:%S"):
         try:
@@ -100,10 +134,6 @@ def parse_as_of_date(value: str) -> date:
         raise ValueError("--as-of-date 必须是 YYYY-MM-DD") from exc
 
 
-def percent_text(value: Optional[float]) -> str:
-    return f"{value:.2%}" if value is not None else ""
-
-
 def normalize_country(value: str) -> str:
     raw = (value or "").strip()
     normalized = COUNTRY_VALUE_MAP.get(raw.upper(), COUNTRY_VALUE_MAP.get(raw, raw))
@@ -112,55 +142,91 @@ def normalize_country(value: str) -> str:
     return normalized
 
 
-async def request(client: FeishuBitableClient, method: str, path: str,
-                  params: Optional[Dict[str, Any]] = None,
-                  payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+async def request(
+    client: FeishuBitableClient,
+    method: str,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     headers = await client._headers()
     url = f"{client.api_base}/{path.lstrip('/')}"
-    async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=20)) as http:
-        response = await http.request(method, url, headers=headers, params=params, json=payload)
+    timeout = httpx.Timeout(120.0, connect=20.0)
+
+    async with httpx.AsyncClient(timeout=timeout) as http_client:
+        response = await http_client.request(
+            method,
+            url,
+            headers=headers,
+            params=params,
+            json=payload,
+        )
+
     try:
         result = response.json()
     except Exception as exc:
-        raise RuntimeError(f"飞书接口返回非 JSON，HTTP {response.status_code}: {response.text[:500]}") from exc
+        raise RuntimeError(
+            f"飞书接口返回非 JSON，HTTP {response.status_code}: {response.text[:500]}"
+        ) from exc
+
     if result.get("code") != 0:
         raise RuntimeError(f"飞书接口失败: {result}")
     return result
 
 
-async def list_records(client: FeishuBitableClient, app_token: str,
-                       table_id: str, view_id: str) -> List[Dict[str, Any]]:
+async def list_records(
+    client: FeishuBitableClient,
+    app_token: str,
+    table_id: str,
+    view_id: str,
+) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     page_token = ""
+
     while True:
         params: Dict[str, Any] = {"page_size": 500}
         if view_id:
             params["view_id"] = view_id
         if page_token:
             params["page_token"] = page_token
-        result = await request(client, "GET",
-            f"bitable/v1/apps/{app_token}/tables/{table_id}/records", params=params)
+
+        result = await request(
+            client,
+            "GET",
+            f"bitable/v1/apps/{app_token}/tables/{table_id}/records",
+            params=params,
+        )
         data = result.get("data") or {}
         rows.extend(data.get("items") or [])
+
         if not data.get("has_more"):
             break
         page_token = str(data.get("page_token") or "")
         if not page_token:
             break
+
     logger.info(f"读取飞书记录完成: {len(rows)} 条")
     return rows
 
 
-async def update_records(client: FeishuBitableClient, app_token: str,
-                         table_id: str, updates: List[Dict[str, Any]]) -> None:
+async def update_records(
+    client: FeishuBitableClient,
+    app_token: str,
+    table_id: str,
+    updates: List[Dict[str, Any]],
+) -> None:
     if not updates:
         logger.warning("没有需要回写的记录")
         return
+
     for start in range(0, len(updates), 500):
-        batch = updates[start:start + 500]
-        await request(client, "POST",
+        batch = updates[start : start + 500]
+        await request(
+            client,
+            "POST",
             f"bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_update",
-            payload={"records": batch})
+            payload={"records": batch},
+        )
         logger.info(f"已更新 {min(start + len(batch), len(updates))}/{len(updates)}")
 
 
@@ -168,21 +234,33 @@ def find_table(table_name: str, schema_name: str) -> Tuple[str, str]:
     with db_cursor() as cursor:
         if schema_name:
             cursor.execute(
-                "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES "
-                "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s",
+                """
+                SELECT TABLE_SCHEMA, TABLE_NAME
+                FROM information_schema.TABLES
+                WHERE TABLE_SCHEMA = %s
+                  AND TABLE_NAME = %s
+                """,
                 (schema_name, table_name),
             )
         else:
             cursor.execute(
-                "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES "
-                "WHERE TABLE_NAME=%s ORDER BY (TABLE_SCHEMA=DATABASE()) DESC, "
-                "(TABLE_SCHEMA LIKE 'dws%%') DESC, TABLE_SCHEMA",
+                """
+                SELECT TABLE_SCHEMA, TABLE_NAME
+                FROM information_schema.TABLES
+                WHERE TABLE_NAME = %s
+                ORDER BY
+                    (TABLE_SCHEMA = DATABASE()) DESC,
+                    (TABLE_SCHEMA LIKE 'dws%%') DESC,
+                    TABLE_SCHEMA
+                """,
                 (table_name,),
             )
         rows = cursor.fetchall()
+
     if not rows:
         target = f"{schema_name}.{table_name}" if schema_name else table_name
         raise RuntimeError(f"未找到数据表: {target}")
+
     row = rows[0]
     return str(row["TABLE_SCHEMA"]), str(row["TABLE_NAME"])
 
@@ -190,8 +268,12 @@ def find_table(table_name: str, schema_name: str) -> Tuple[str, str]:
 def get_table_columns(schema: str, table: str) -> Set[str]:
     with db_cursor() as cursor:
         cursor.execute(
-            "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
-            "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s",
+            """
+            SELECT COLUMN_NAME
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = %s
+              AND TABLE_NAME = %s
+            """,
             (schema, table),
         )
         return {str(row["COLUMN_NAME"]) for row in cursor.fetchall()}
@@ -204,6 +286,7 @@ def get_source_max_date(schema: str, table: str) -> Optional[date]:
             f"FROM {quote_identifier(schema)}.{quote_identifier(table)}"
         )
         row = cursor.fetchone() or {}
+
     value = row.get("max_dt")
     if isinstance(value, datetime):
         return value.date()
@@ -214,7 +297,7 @@ def get_source_max_date(schema: str, table: str) -> Optional[date]:
     return None
 
 
-def resolve_source_layout(schema: str, table: str) -> Tuple[str, Set[str]]:
+def resolve_source_layout(schema: str, table: str) -> str:
     columns = get_table_columns(schema, table)
     missing = sorted(CORE_SOURCE_COLUMNS - columns)
     if missing:
@@ -222,6 +305,7 @@ def resolve_source_layout(schema: str, table: str) -> Tuple[str, Set[str]]:
             f"源表 {schema}.{table} 缺少基础字段: {', '.join(missing)}；"
             f"当前字段: {', '.join(sorted(columns))}"
         )
+
     if "spu" in columns:
         product_expr = quote_identifier("spu")
         product_note = "spu"
@@ -229,21 +313,34 @@ def resolve_source_layout(schema: str, table: str) -> Tuple[str, Set[str]]:
         product_expr = f"SUBSTRING_INDEX({quote_identifier('sku')}, '-', 1)"
         product_note = "SUBSTRING_INDEX(sku, '-', 1)"
     else:
-        raise RuntimeError(f"源表 {schema}.{table} 既没有 spu，也没有可用于提取款号的 sku")
+        raise RuntimeError(
+            f"源表 {schema}.{table} 既没有 spu，也没有可用于提取款号的 sku"
+        )
+
     logger.info(f"款号口径使用: {product_note}")
     logger.info("转化率暂不生成：源表尚无 Sessions 字段")
-    return product_expr, columns
+    return product_expr
 
 
-def query_metrics(schema: str, table: str, product_expr: str, spu: str,
-                  stores: List[str], start_date: date, end_date: date,
-                  recent_start: date, recent_end: date, country: str) -> Dict[str, Any]:
+def query_metrics(
+    schema: str,
+    table: str,
+    product_expr: str,
+    spu: str,
+    stores: List[str],
+    start_date: date,
+    end_date: date,
+    recent_start: date,
+    recent_end: date,
+    country: str,
+) -> Dict[str, Any]:
     placeholders = ",".join(["%s"] * len(stores))
     dt_sql = quote_identifier("dt")
     clicks_sql = quote_identifier("clicks")
     impressions_sql = quote_identifier("impressions")
     ad_order_sql = quote_identifier("ad_order_qty")
     ad_cost_sql = quote_identifier("ad_cost_amt")
+
     sql = f"""
         SELECT
             COUNT(*) AS source_rows,
@@ -251,36 +348,63 @@ def query_metrics(schema: str, table: str, product_expr: str, spu: str,
             SUM(COALESCE({impressions_sql}, 0)) AS impressions,
             SUM(COALESCE({ad_order_sql}, 0)) AS ad_order_qty,
             SUM(COALESCE({ad_cost_sql}, 0)) AS ad_cost_amt,
-            SUM(CASE WHEN {dt_sql} BETWEEN %s AND %s THEN COALESCE({clicks_sql}, 0) ELSE 0 END) AS recent_clicks,
-            SUM(CASE WHEN {dt_sql} BETWEEN %s AND %s THEN COALESCE({impressions_sql}, 0) ELSE 0 END) AS recent_impressions
+            SUM(
+                CASE
+                    WHEN {dt_sql} BETWEEN %s AND %s
+                    THEN COALESCE({clicks_sql}, 0)
+                    ELSE 0
+                END
+            ) AS recent_clicks,
+            SUM(
+                CASE
+                    WHEN {dt_sql} BETWEEN %s AND %s
+                    THEN COALESCE({impressions_sql}, 0)
+                    ELSE 0
+                END
+            ) AS recent_impressions
         FROM {quote_identifier(schema)}.{quote_identifier(table)}
         WHERE {dt_sql} BETWEEN %s AND %s
           AND {product_expr} = %s
           AND {quote_identifier('store_name')} IN ({placeholders})
           AND {quote_identifier('country')} = %s
     """
+
     params: List[Any] = [
-        recent_start, recent_end, recent_start, recent_end,
-        start_date, end_date, spu, *stores, country,
+        recent_start,
+        recent_end,
+        recent_start,
+        recent_end,
+        start_date,
+        end_date,
+        spu,
+        *stores,
+        country,
     ]
+
     with db_cursor() as cursor:
         cursor.execute(sql, params)
         row = cursor.fetchone() or {}
+
     clicks = float(row.get("clicks") or 0)
     impressions = float(row.get("impressions") or 0)
     ad_order_qty = float(row.get("ad_order_qty") or 0)
     ad_cost_amt = float(row.get("ad_cost_amt") or 0)
     recent_clicks = float(row.get("recent_clicks") or 0)
     recent_impressions = float(row.get("recent_impressions") or 0)
-    recent_ctr = round(recent_clicks / recent_impressions, 6) if recent_impressions else None
+
+    recent_ctr = (
+        round(recent_clicks / recent_impressions, 6)
+        if recent_impressions
+        else None
+    )
+
     return {
         "source_rows": int(row.get("source_rows") or 0),
         "点击量": int(round(clicks)),
         "CTR": round(clicks / impressions, 6) if impressions else None,
         "CPC": round(ad_cost_amt / clicks, 6) if clicks else None,
         "广告转化率": round(ad_order_qty / clicks, 6) if clicks else None,
-        "近七天数据（最新主图）": percent_text(recent_ctr),
-        "recent_ctr": recent_ctr,
+        "近七天数据（最新主图）": recent_ctr,
     }
 
 
@@ -288,9 +412,10 @@ async def run(args: argparse.Namespace) -> None:
     as_of_date = parse_as_of_date(args.as_of_date)
     t_minus_1 = as_of_date - timedelta(days=1)
     logger.info(f"本次运行基准日 T={as_of_date}，默认截至日 T-1={t_minus_1}")
+
     schema, table = find_table(args.source_table, args.source_schema)
     logger.info(f"数据源: {schema}.{table}")
-    product_expr, _ = resolve_source_layout(schema, table)
+    product_expr = resolve_source_layout(schema, table)
 
     db_country = normalize_country(args.country)
     logger.info(f"国家过滤值: {args.country} -> {db_country}")
@@ -305,35 +430,63 @@ async def run(args: argparse.Namespace) -> None:
 
     client = FeishuBitableClient(args.app_token)
     fields = await client.list_fields(args.table_id)
+
     ad_conversion_field_exists = "广告转化率" in fields
     if not ad_conversion_field_exists:
         if args.dry_run:
-            logger.warning("飞书表暂缺‘广告转化率’字段；本次只读试跑仍会计算该指标，正式执行时将自动创建字段")
+            logger.warning(
+                "飞书表暂缺‘广告转化率’字段；本次只读试跑仍会计算该指标，"
+                "正式执行时将自动创建字段"
+            )
         else:
-            await client.create_field(args.table_id, "广告转化率", 2, precision=6)
+            await client.create_field(
+                args.table_id,
+                "广告转化率",
+                2,
+                precision=6,
+            )
             fields = await client.list_fields(args.table_id)
             ad_conversion_field_exists = "广告转化率" in fields
 
-    required_fields = INPUT_FIELDS | {"CTR", "CPC", "点击量"} | TEXT_OUTPUT_FIELDS
+    required_fields = INPUT_FIELDS | {
+        "CTR",
+        "CPC",
+        "点击量",
+        "近七天数据（最新主图）",
+    }
     if not args.dry_run or ad_conversion_field_exists:
         required_fields.add("广告转化率")
+
     missing = sorted(required_fields - set(fields))
     if missing:
         raise RuntimeError(f"飞书表缺少字段: {', '.join(missing)}")
 
-    numeric_fields_to_check = {"CTR", "CPC", "点击量"}
+    numeric_fields_to_check = {
+        "CTR",
+        "CPC",
+        "点击量",
+        "近七天数据（最新主图）",
+    }
     if ad_conversion_field_exists:
         numeric_fields_to_check.add("广告转化率")
+
     wrong_numeric_types = [
-        name for name in numeric_fields_to_check
+        name
+        for name in numeric_fields_to_check
         if int(fields[name].get("type") or 0) != 2
     ]
     if wrong_numeric_types:
-        raise RuntimeError(f"回写字段不是数字类型: {', '.join(sorted(wrong_numeric_types))}")
-    if int(fields["近七天数据（最新主图）"].get("type") or 0) != 1:
-        raise RuntimeError("飞书字段‘近七天数据（最新主图）’必须是文本类型")
+        raise RuntimeError(
+            "以下飞书回写字段必须是数字类型: "
+            + ", ".join(sorted(wrong_numeric_types))
+        )
 
-    records = await list_records(client, args.app_token, args.table_id, args.view_id)
+    records = await list_records(
+        client,
+        args.app_token,
+        args.table_id,
+        args.view_id,
+    )
     updates: List[Dict[str, Any]] = []
     skipped = 0
     skip_reasons: Counter[str] = Counter()
@@ -343,6 +496,7 @@ async def run(args: argparse.Namespace) -> None:
         values = record.get("fields") or {}
         spu = text(values.get("款号"))
         brands = options(values.get("店铺"))
+
         try:
             start_date = parse_date(values.get("更换日期"))
             explicit_end_date = parse_date(values.get("更换截至日期"))
@@ -361,9 +515,11 @@ async def run(args: argparse.Namespace) -> None:
             reasons.append("缺少店铺")
         if not start_date:
             reasons.append("缺少更换日期")
+
         unknown = [brand for brand in brands if brand not in STORE_MAP]
         if unknown:
             reasons.append(f"店铺未映射: {unknown}")
+
         if reasons:
             logger.warning(f"跳过 {spu or record_id}: {'；'.join(reasons)}")
             skipped += 1
@@ -374,8 +530,11 @@ async def run(args: argparse.Namespace) -> None:
         assert start_date is not None
         end_date = explicit_end_date or t_minus_1
         end_source = "更换截至日期" if explicit_end_date else "T-1"
+
         if end_date < start_date:
-            logger.warning(f"跳过 {spu}: 区间结束日 {end_date} 早于更换日期 {start_date}")
+            logger.warning(
+                f"跳过 {spu}: 区间结束日 {end_date} 早于更换日期 {start_date}"
+            )
             skipped += 1
             skip_reasons["结束日早于开始日"] += 1
             continue
@@ -383,31 +542,63 @@ async def run(args: argparse.Namespace) -> None:
         recent_end = end_date
         recent_start = max(start_date, recent_end - timedelta(days=6))
         stores = sorted({STORE_MAP[brand] for brand in brands})
+
         metrics = query_metrics(
-            schema=schema, table=table, product_expr=product_expr, spu=spu,
-            stores=stores, start_date=start_date, end_date=end_date,
-            recent_start=recent_start, recent_end=recent_end, country=db_country,
+            schema=schema,
+            table=table,
+            product_expr=product_expr,
+            spu=spu,
+            stores=stores,
+            start_date=start_date,
+            end_date=end_date,
+            recent_start=recent_start,
+            recent_end=recent_end,
+            country=db_country,
         )
-        output = {name: metrics[name] for name in ALL_OUTPUT_FIELDS}
-        updates.append({"record_id": record_id, "fields": output})
+
+        output = {
+            name: metrics[name]
+            for name in NUMERIC_OUTPUT_FIELDS
+        }
+        updates.append(
+            {
+                "record_id": record_id,
+                "fields": output,
+            }
+        )
+
         logger.info(
             f"{spu} | {brands}->{stores} | country={db_country} | "
             f"主区间={start_date}~{end_date}({end_source}) | "
-            f"近7天={recent_start}~{recent_end} | rows={metrics['source_rows']} | "
-            f"点击量={metrics['点击量']} | CTR={metrics['CTR']} | "
-            f"CPC={metrics['CPC']} | 广告转化率={metrics['广告转化率']} | "
-            f"近7天CTR={metrics['近七天数据（最新主图）'] or '空'}"
+            f"近7天={recent_start}~{recent_end} | "
+            f"rows={metrics['source_rows']} | "
+            f"点击量={metrics['点击量']} | "
+            f"CTR={metrics['CTR']} | "
+            f"CPC={metrics['CPC']} | "
+            f"广告转化率={metrics['广告转化率']} | "
+            f"近7天CTR={metrics['近七天数据（最新主图）']}"
         )
+
         if args.limit and len(updates) >= args.limit:
             break
 
     logger.info(f"生成回写结果 {len(updates)} 条，跳过 {skipped} 条")
     if skip_reasons:
-        logger.info("跳过原因汇总: " + "；".join(f"{k}={v}" for k, v in skip_reasons.items()))
+        logger.info(
+            "跳过原因汇总: "
+            + "；".join(f"{reason}={count}" for reason, count in skip_reasons.items())
+        )
+
     if args.dry_run:
         logger.info("DRY RUN：未创建字段、未修改飞书记录")
         return
-    await update_records(client, args.app_token, args.table_id, updates)
+
+    await update_records(
+        client,
+        args.app_token,
+        args.table_id,
+        updates,
+    )
     logger.info("回写完成；飞书‘转化率’字段未被修改")
 
 
@@ -417,13 +608,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--table-id", required=True)
     parser.add_argument("--view-id", default="")
     parser.add_argument("--source-schema", default="")
-    parser.add_argument("--source-table", default="dws_op_listing_traffic_daily")
     parser.add_argument(
-        "--country", default="US",
+        "--source-table",
+        default="dws_op_listing_traffic_daily",
+    )
+    parser.add_argument(
+        "--country",
+        default="US",
         help="国家，可传 US/美国、CA/加拿大、MX/墨西哥等；脚本会转换为数据库实际值",
     )
     parser.add_argument(
-        "--as-of-date", default="",
+        "--as-of-date",
+        default="",
         help="运行基准日 T，格式 YYYY-MM-DD；默认使用服务器当天日期",
     )
     parser.add_argument("--limit", type=int, default=0)
