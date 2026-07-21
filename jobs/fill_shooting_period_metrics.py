@@ -290,23 +290,34 @@ async def run(args: argparse.Namespace) -> None:
 
     client = FeishuBitableClient(args.app_token)
     fields = await client.list_fields(args.table_id)
+    ad_conversion_field_exists = "广告转化率" in fields
 
-    if "广告转化率" not in fields:
+    if not ad_conversion_field_exists:
         if args.dry_run:
-            raise RuntimeError(
-                "飞书表缺少字段“广告转化率”。DRY RUN 不创建字段；"
-                "请先正式运行一次或手动创建数字字段。"
+            logger.warning(
+                "飞书表暂缺“广告转化率”字段；本次只读试跑仍会计算该指标，"
+                "正式执行时将自动创建字段"
             )
-        await client.create_field(args.table_id, "广告转化率", 2, precision=6)
-        fields = await client.list_fields(args.table_id)
+        else:
+            await client.create_field(args.table_id, "广告转化率", 2, precision=6)
+            fields = await client.list_fields(args.table_id)
+            ad_conversion_field_exists = "广告转化率" in fields
 
-    missing = sorted((INPUT_FIELDS | OUTPUT_FIELDS) - set(fields))
+    required_fields = INPUT_FIELDS | {"CTR", "CPC", "点击量"}
+    if not args.dry_run or ad_conversion_field_exists:
+        required_fields.add("广告转化率")
+
+    missing = sorted(required_fields - set(fields))
     if missing:
         raise RuntimeError(f"飞书表缺少字段: {', '.join(missing)}")
 
+    fields_to_type_check = {"CTR", "CPC", "点击量"}
+    if ad_conversion_field_exists:
+        fields_to_type_check.add("广告转化率")
+
     wrong_types = [
         name
-        for name in OUTPUT_FIELDS
+        for name in fields_to_type_check
         if int(fields[name].get("type") or 0) != 2
     ]
     if wrong_types:
@@ -377,7 +388,7 @@ async def run(args: argparse.Namespace) -> None:
 
     logger.info(f"生成回写结果 {len(updates)} 条，跳过 {skipped} 条")
     if args.dry_run:
-        logger.info("DRY RUN：未修改飞书")
+        logger.info("DRY RUN：未创建字段、未修改飞书记录")
         return
 
     await update_records(client, args.app_token, args.table_id, updates)
