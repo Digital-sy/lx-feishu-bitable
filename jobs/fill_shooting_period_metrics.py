@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""按飞书记录中的款号、店铺和更换日期区间，回填可由当前 DWS 支持的指标。
+
+当前回填：
+- 点击量
+- CTR = 点击量 / 展示量
+- CPC = 广告花费 / 点击量
+- 广告转化率 = 广告订单量 / 点击量
+
+当前 dws_op_listing_traffic_daily 尚无 Sessions 字段，因此本脚本不计算、
+不校验、也不更新飞书中的“转化率”字段。
+"""
 from __future__ import annotations
 
 import argparse
@@ -29,14 +40,13 @@ STORE_MAP = {
 }
 
 INPUT_FIELDS = {"款号", "店铺", "更换日期", "更换截至日期"}
-OUTPUT_FIELDS = {"CTR", "CPC", "点击量", "转化率", "广告转化率"}
+OUTPUT_FIELDS = {"CTR", "CPC", "点击量", "广告转化率"}
 CORE_SOURCE_COLUMNS = {
     "dt",
     "store_name",
     "country",
     "clicks",
     "impressions",
-    "order_qty",
     "ad_order_qty",
     "ad_cost_amt",
 }
@@ -73,6 +83,7 @@ def parse_date(value: Any) -> Optional[date]:
         if stamp > 10_000_000_000:
             stamp /= 1000
         return datetime.fromtimestamp(stamp).date()
+
     value_text = text(value)
     for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%d %H:%M:%S"):
         try:
@@ -92,13 +103,21 @@ async def request(
     headers = await client._headers()
     url = f"{client.api_base}/{path.lstrip('/')}"
     async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=20)) as http:
-        response = await http.request(method, url, headers=headers, params=params, json=payload)
+        response = await http.request(
+            method,
+            url,
+            headers=headers,
+            params=params,
+            json=payload,
+        )
+
     try:
         result = response.json()
     except Exception as exc:
         raise RuntimeError(
             f"飞书接口返回非 JSON，HTTP {response.status_code}: {response.text[:500]}"
         ) from exc
+
     if result.get("code") != 0:
         raise RuntimeError(f"飞书接口失败: {result}")
     return result
@@ -112,12 +131,14 @@ async def list_records(
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     page_token = ""
+
     while True:
         params: Dict[str, Any] = {"page_size": 500}
         if view_id:
             params["view_id"] = view_id
         if page_token:
             params["page_token"] = page_token
+
         result = await request(
             client,
             "GET",
@@ -126,11 +147,14 @@ async def list_records(
         )
         data = result.get("data") or {}
         rows.extend(data.get("items") or [])
+
         if not data.get("has_more"):
             break
         page_token = str(data.get("page_token") or "")
         if not page_token:
             break
+
+    logger.info(f"读取飞书记录完成: {len(rows)} 条")
     return rows
 
 
@@ -140,6 +164,10 @@ async def update_records(
     table_id: str,
     updates: List[Dict[str, Any]],
 ) -> None:
+    if not updates:
+        logger.warning("没有需要回写的记录")
+        return
+
     for start in range(0, len(updates), 500):
         batch = updates[start:start + 500]
         await request(
@@ -167,8 +195,11 @@ def find_table(table_name: str, schema_name: str) -> Tuple[str, str]:
                 (table_name,),
             )
         rows = cursor.fetchall()
+
     if not rows:
-        raise RuntimeError(f"未找到数据表: {schema_name + '.' if schema_name else ''}{table_name}")
+        target = f"{schema_name}.{table_name}" if schema_name else table_name
+        raise RuntimeError(f"未找到数据表: {target}")
+
     row = rows[0]
     return str(row["TABLE_SCHEMA"]), str(row["TABLE_NAME"])
 
@@ -183,7 +214,7 @@ def get_table_columns(schema: str, table: str) -> Set[str]:
         return {str(row["COLUMN_NAME"]) for row in cursor.fetchall()}
 
 
-def resolve_source_layout(schema: str, table: str) -> Tuple[str, str, Set[str]]:
+def resolve_source_layout(schema: str, table: str) -> Tuple[str, Set[str]]:
     columns = get_table_columns(schema, table)
     missing = sorted(CORE_SOURCE_COLUMNS - columns)
     if missing:
@@ -203,28 +234,15 @@ def resolve_source_layout(schema: str, table: str) -> Tuple[str, str, Set[str]]:
             f"源表 {schema}.{table} 既没有 spu，也没有可用于提取款号的 sku"
         )
 
-    if "sessions_total" in columns:
-        sessions_expr = quote_identifier("sessions_total")
-        sessions_note = "sessions_total"
-    elif "sessions" in columns:
-        sessions_expr = quote_identifier("sessions")
-        sessions_note = "sessions"
-    else:
-        raise RuntimeError(
-            f"源表 {schema}.{table} 既没有 sessions_total，也没有 sessions；"
-            "无法按 订单量 / Sessions 计算转化率"
-        )
-
     logger.info(f"款号口径使用: {product_note}")
-    logger.info(f"Sessions口径使用: {sessions_note}")
-    return product_expr, sessions_expr, columns
+    logger.info("转化率暂不生成：源表尚无 Sessions 字段")
+    return product_expr, columns
 
 
 def query_metrics(
     schema: str,
     table: str,
     product_expr: str,
-    sessions_expr: str,
     spu: str,
     stores: List[str],
     start_date: date,
@@ -237,33 +255,30 @@ def query_metrics(
             COUNT(*) AS source_rows,
             SUM(COALESCE({quote_identifier('clicks')}, 0)) AS clicks,
             SUM(COALESCE({quote_identifier('impressions')}, 0)) AS impressions,
-            SUM(COALESCE({quote_identifier('order_qty')}, 0)) AS order_qty,
             SUM(COALESCE({quote_identifier('ad_order_qty')}, 0)) AS ad_order_qty,
-            SUM(COALESCE({quote_identifier('ad_cost_amt')}, 0)) AS ad_cost_amt,
-            SUM(COALESCE({sessions_expr}, 0)) AS sessions_total
+            SUM(COALESCE({quote_identifier('ad_cost_amt')}, 0)) AS ad_cost_amt
         FROM {quote_identifier(schema)}.{quote_identifier(table)}
         WHERE {quote_identifier('dt')} BETWEEN %s AND %s
           AND {product_expr} = %s
           AND {quote_identifier('store_name')} IN ({placeholders})
           AND {quote_identifier('country')} = %s
     """
+
+    params: List[Any] = [start_date, end_date, spu, *stores, country]
     with db_cursor() as cursor:
-        cursor.execute(sql, [start_date, end_date, spu, *stores, country])
+        cursor.execute(sql, params)
         row = cursor.fetchone() or {}
 
     clicks = float(row.get("clicks") or 0)
     impressions = float(row.get("impressions") or 0)
-    order_qty = float(row.get("order_qty") or 0)
     ad_order_qty = float(row.get("ad_order_qty") or 0)
     ad_cost_amt = float(row.get("ad_cost_amt") or 0)
-    sessions_total = float(row.get("sessions_total") or 0)
 
     return {
         "source_rows": int(row.get("source_rows") or 0),
         "点击量": int(round(clicks)),
         "CTR": round(clicks / impressions, 6) if impressions else None,
         "CPC": round(ad_cost_amt / clicks, 6) if clicks else None,
-        "转化率": round(order_qty / sessions_total, 6) if sessions_total else None,
         "广告转化率": round(ad_order_qty / clicks, 6) if clicks else None,
     }
 
@@ -271,11 +286,17 @@ def query_metrics(
 async def run(args: argparse.Namespace) -> None:
     schema, table = find_table(args.source_table, args.source_schema)
     logger.info(f"数据源: {schema}.{table}")
-    product_expr, sessions_expr, _ = resolve_source_layout(schema, table)
+    product_expr, _ = resolve_source_layout(schema, table)
 
     client = FeishuBitableClient(args.app_token)
     fields = await client.list_fields(args.table_id)
+
     if "广告转化率" not in fields:
+        if args.dry_run:
+            raise RuntimeError(
+                "飞书表缺少字段“广告转化率”。DRY RUN 不创建字段；"
+                "请先正式运行一次或手动创建数字字段。"
+            )
         await client.create_field(args.table_id, "广告转化率", 2, precision=6)
         fields = await client.list_fields(args.table_id)
 
@@ -284,7 +305,8 @@ async def run(args: argparse.Namespace) -> None:
         raise RuntimeError(f"飞书表缺少字段: {', '.join(missing)}")
 
     wrong_types = [
-        name for name in OUTPUT_FIELDS
+        name
+        for name in OUTPUT_FIELDS
         if int(fields[name].get("type") or 0) != 2
     ]
     if wrong_types:
@@ -309,8 +331,17 @@ async def run(args: argparse.Namespace) -> None:
             continue
 
         unknown = [brand for brand in brands if brand not in STORE_MAP]
-        if not record_id or not spu or not brands or not start_date or not end_date or unknown:
-            logger.warning(f"跳过 {spu or record_id}: 条件不完整或店铺未映射 {unknown}")
+        if (
+            not record_id
+            or not spu
+            or not brands
+            or not start_date
+            or not end_date
+            or unknown
+        ):
+            logger.warning(
+                f"跳过 {spu or record_id}: 条件不完整或店铺未映射 {unknown}"
+            )
             skipped += 1
             continue
 
@@ -321,16 +352,16 @@ async def run(args: argparse.Namespace) -> None:
 
         stores = sorted({STORE_MAP[brand] for brand in brands})
         metrics = query_metrics(
-            schema,
-            table,
-            product_expr,
-            sessions_expr,
-            spu,
-            stores,
-            start_date,
-            end_date,
-            args.country,
+            schema=schema,
+            table=table,
+            product_expr=product_expr,
+            spu=spu,
+            stores=stores,
+            start_date=start_date,
+            end_date=end_date,
+            country=args.country,
         )
+
         output = {name: metrics[name] for name in OUTPUT_FIELDS}
         updates.append({"record_id": record_id, "fields": output})
 
@@ -338,7 +369,7 @@ async def run(args: argparse.Namespace) -> None:
             f"{spu} | {brands}->{stores} | {start_date}~{end_date} | "
             f"rows={metrics['source_rows']} | 点击量={metrics['点击量']} | "
             f"CTR={metrics['CTR']} | CPC={metrics['CPC']} | "
-            f"转化率={metrics['转化率']} | 广告转化率={metrics['广告转化率']}"
+            f"广告转化率={metrics['广告转化率']}"
         )
 
         if args.limit and len(updates) >= args.limit:
@@ -350,11 +381,11 @@ async def run(args: argparse.Namespace) -> None:
         return
 
     await update_records(client, args.app_token, args.table_id, updates)
-    logger.info("回写完成")
+    logger.info("回写完成；飞书‘转化率’字段未被修改")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="回填拍摄效果区间指标")
     parser.add_argument("--app-token", required=True)
     parser.add_argument("--table-id", required=True)
     parser.add_argument("--view-id", default="")
